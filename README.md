@@ -629,6 +629,13 @@ App\Domain\Model\User:
 Dealing with pagination is a task that is often needed.
 This package contains some tools to help you with that:
 
+* `WindowCountPager` - the default: one query, the total counted with a window function.
+* `DeferredProjectionPager` - for rows that carry aggregated or joined objects.
+
+Both are honest implementations of `Pager` and both stay: pick the one that matches the width of your rows.
+
+## WindowCountPager
+
 ```php
 use Phpro\DbalTools\Pager\MappingPager;
 use Phpro\DbalTools\Pager\Pager;
@@ -651,6 +658,93 @@ $totalResults = $usersPager->totalResults();
 $totalPages = $usersPager->totalPages();
 $users = [...$usersPager];
 ```
+
+## DeferredProjectionPager
+
+`WindowCountPager` adds `COUNT(1) OVER()` to the query it pages.
+PostgreSQL evaluates window functions before `ORDER BY`/`LIMIT` at the same query level, so every matching
+row is buffered before the page is cut.
+That is free for a narrow row, and expensive as soon as the row carries a `jsonb_build_object` or a
+`jsonb_agg_strict` projection over joined tables: those buffered rows are kilobytes wide and spill to temp
+files.
+
+`DeferredProjectionPager` pages *narrow* rows - the key column plus the count window - inside a CTE, and
+joins the fat projection onto that CTE.
+The total is still computed over the whole matching set, but out of `(key, total)` rows, and the expensive
+projection is only evaluated for the page that is returned.
+It remains a single statement, so there is one snapshot and no second round trip.
+
+**Which one to reach for:**
+
+* `WindowCountPager` for a narrow row. It is correct, cheaper, and pays nothing for a CTE it does not need.
+* `DeferredProjectionPager` when a row carries aggregated or joined objects.
+
+```php
+use Doctrine\DBAL\Query\QueryBuilder;
+use Phpro\DbalTools\Expression\Alias;
+use Phpro\DbalTools\Expression\JsonbAggStrict;
+use Phpro\DbalTools\Expression\JsonbBuildObject;
+use Phpro\DbalTools\Expression\OrderBy;
+use Phpro\DbalTools\Pager\DeferredProjectionPager;
+use Phpro\DbalTools\Pager\MappingPager;
+use Phpro\DbalTools\Pager\Pagination;
+use Phpro\DbalTools\Query\CompositeQuery;
+
+// The narrow half: the key column and the filters. No projection, no join.
+$narrowPage = new CompositeQuery(
+    $connection,
+    $connection->createQueryBuilder()
+        ->select(UsersTableColumns::Id->select())
+        ->from(UsersTable::name()),
+    [],
+);
+
+$usersPager = new MappingPager(
+    DeferredProjectionPager::create(
+        new Pagination(page: $page, limit: $limit),
+        $narrowPage,
+        UsersTableColumns::Id->column(),
+        new OrderBy(OrderBy::field(UsersTableColumns::Username->column(), OrderBy::ASC)),
+        // The fat half: returned, not written in place, and it knows nothing about the page CTE.
+        static fn (CompositeQuery $folded, string $pageAlias): QueryBuilder => $connection->createQueryBuilder()
+            ->select(
+                ...UsersTable::columns()->select(),
+                ...[new Alias(
+                    JsonbAggStrict::onManyLeftJoinedJsonObjects(
+                        new JsonbBuildObject([
+                            'id' => PostsTableColumns::Id->column(),
+                            'post' => PostsTableColumns::Post->column(),
+                        ]),
+                        PostsTableColumns::Id->column(),
+                    ),
+                    'posts',
+                )->toSQL()],
+            )
+            ->from(UsersTable::name())
+            ->leftJoin(...UsersTable::joinOntoPosts())
+            ->groupBy(UsersTableColumns::Id->use()),
+    ),
+    $userMapper,
+);
+```
+
+Things worth knowing:
+
+* The filters and the scope joins belong on the **narrow** query. A filter applied by the hydration closure
+  would narrow the page after the total was computed, so the total would over-report.
+* Every CTE you registered on `$narrowPage` survives the fold, and so does a parameter bound on its main
+  query: that same query builder is moved into the `WITH` list, and `CompositeQuery::execute()` merges the
+  parameters of every registered builder.
+* The key must be table qualified (the join is derived from it) and unique in the narrow set. A duplicate
+  multiplies the hydrated rows and makes the total disagree with the page.
+* Aggregate freely. The pager reads its count as a scalar sub-query rather than as a column of the joined
+  CTE, so a hydration query that groups needs no group-by for it.
+* The pager owns the join onto the page CTE, the count column, and the order - which it applies to both
+  levels, since the narrow sort decides *which* rows the page holds and the outer one the order they come
+  back in. The closure only supplies its projection.
+* The hydration closure **returns** its query rather than writing onto the folded main query, because
+  `QueryBuilder` keeps its select, from and join parts private with no setters.
+* Rows are yielded verbatim, the count field included, exactly like `WindowCountPager`.
 
 # Building queries
 
