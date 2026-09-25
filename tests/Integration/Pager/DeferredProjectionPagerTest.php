@@ -94,7 +94,7 @@ final class DeferredProjectionPagerTest extends DbalReaderTestCase
     }
 
     /**
-     * The total is the number of keys in the narrow set, not the number of rows the hydration join
+     * The total is the number of keys in the narrow set, not the number of rows the projection join
      * produces. That is the difference from counting over the fat query, where the one-to-many join
      * inflates every total.
      */
@@ -118,7 +118,7 @@ final class DeferredProjectionPagerTest extends DbalReaderTestCase
      * the two rows of the page rather than for all six.
      */
     #[Test]
-    public function it_hydrates_every_row_of_the_page_with_its_aggregated_objects(): void
+    public function it_projects_every_row_of_the_page_with_its_aggregated_objects(): void
     {
         $rows = values(self::pager(new Pagination(2, 2)));
 
@@ -269,7 +269,7 @@ final class DeferredProjectionPagerTest extends DbalReaderTestCase
     #[TestWith([2, OrderBy::ASC, ['user4', 'user5', 'user6']])]
     #[TestWith([1, OrderBy::DESC, ['user6', 'user5', 'user4']])]
     #[TestWith([2, OrderBy::DESC, ['user3', 'user2', 'user1']])]
-    public function it_orders_the_hydrated_page(int $page, string $direction, array $expected): void
+    public function it_orders_the_projected_page(int $page, string $direction, array $expected): void
     {
         $pager = self::pager(
             new Pagination($page, 3),
