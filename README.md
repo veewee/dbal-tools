@@ -690,7 +690,7 @@ use Phpro\DbalTools\Pager\MappingPager;
 use Phpro\DbalTools\Pager\Pagination;
 use Phpro\DbalTools\Query\CompositeQuery;
 
-// The key column and every filter. No projection, no join that only adds data.
+// Which rows: the key column and every filter. No display columns, no join that only adds data.
 $matchingKeys = new CompositeQuery(
     $connection,
     $connection->createQueryBuilder()
@@ -705,7 +705,8 @@ $usersPager = new MappingPager(
         matchingKeys: $matchingKeys,
         key: UsersTableColumns::Id->column(),
         order: new OrderBy(OrderBy::field(UsersTableColumns::Username->column(), OrderBy::ASC)),
-        // The wide select: returned, not written in place, and it knows nothing about the page CTE.
+        // What a row looks like: a new query from the table of the key.
+        // This one needs no CTE, so it ignores both arguments.
         projection: static fn (CompositeQuery $folded, string $pageAlias): QueryBuilder => $connection->createQueryBuilder()
             ->select(
                 ...UsersTable::columns()->select(),
@@ -727,6 +728,18 @@ $usersPager = new MappingPager(
     $userMapper,
 );
 ```
+
+You describe the list twice:
+
+* `matchingKeys` decides which rows are in the list: a composite whose main query selects the key column
+  and nothing else, with every filter and scope join. No display columns, order or limit, the pager adds
+  those.
+* `key` is that column, table qualified. The page is joined back to the projection on it.
+* `projection` decides what a row looks like: a new query builder selecting everything a row shows from the
+  table of the key, with its joins, aggregates and group by, and no filters, order or limit. The closure
+  receives the composite that will run and the name of the page CTE. Use the composite to join a CTE
+  registered on `matchingKeys` or to register one of your own; a projection that needs no CTE ignores both
+  arguments.
 
 Things worth knowing:
 

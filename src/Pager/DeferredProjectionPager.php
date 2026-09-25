@@ -53,17 +53,26 @@ final readonly class DeferredProjectionPager implements Pager
     }
 
     /**
-     * `$matchingKeys` is a composite whose main query selects only `$key` and carries every filter, since it
-     * decides which rows exist and what the total counts; every CTE registered on it survives the fold.
+     * You describe the list twice: which rows are in it, and what a row looks like.
      *
-     * `$key` is the column joining the matching keys to the projection, and must be unique among them: a
-     * duplicate multiplies the projected rows and the total disagrees with the page.
+     * `$matchingKeys` decides which rows are in the list. Its main query selects `$key` and nothing else,
+     * and carries every filter and scope join, for example `SELECT users.id FROM users WHERE ...`. Leave
+     * out display columns, order and limit: the pager adds the total, the order and the page. Every CTE
+     * registered on it stays available to the projection.
      *
-     * `$order` is applied to both levels, since the narrow sort decides which rows the page holds and the
-     * outer one the order they come back in.
+     * `$key` is the column that main query selects, table qualified (`users.id`). The page is joined back
+     * to the projection on it, so it must be unique per row: a duplicate multiplies the projected rows and
+     * the total disagrees with the page.
      *
-     * `$projection` returns the wide select for the folded composite. The join onto the page and the total
-     * are the pager's job, not its, and a filter here would drop rows after the total was counted.
+     * `$order` sorts the list. It is applied to both levels, since the narrow sort decides which rows the
+     * page holds and the outer one the order they come back in.
+     *
+     * `$projection` decides what a row looks like. Return a new query builder that selects everything a row
+     * shows `FROM` the table of `$key`, including any joins, aggregates and group by it needs. Leave out
+     * filters, order and limit: the pager joins it onto the page, and a filter here would drop rows after
+     * the total was counted. The closure receives the composite that will run and the name of the page
+     * CTE. A projection that needs a CTE joins one registered on `$matchingKeys` through the composite, or
+     * registers its own on it; one that needs none ignores both arguments.
      *
      * @param \Closure(CompositeQuery, non-empty-string): QueryBuilder $projection
      * @param non-empty-string                                         $countField
