@@ -53,34 +53,34 @@ final readonly class DeferredProjectionPager implements Pager
     }
 
     /**
-     * `$narrowPage` is a composite whose main query selects only `$key` and carries the filters; every CTE
-     * registered on it survives the fold.
+     * `$matchingKeys` is a composite whose main query selects only `$key` and carries every filter, since it
+     * decides which rows exist and what the total counts; every CTE registered on it survives the fold.
      *
-     * `$key` is the column joining narrow to fat, and must be unique in the narrow set: a duplicate
-     * multiplies the hydrated rows and the total disagrees with the page.
+     * `$key` is the column joining the matching keys to the projection, and must be unique among them: a
+     * duplicate multiplies the projected rows and the total disagrees with the page.
      *
      * `$order` is applied to both levels, since the narrow sort decides which rows the page holds and the
      * outer one the order they come back in.
      *
-     * `$hydrate` returns the fat projection for the folded composite. The join onto the page and the total
-     * are the pager's job, not its.
+     * `$projection` returns the wide select for the folded composite. The join onto the page and the total
+     * are the pager's job, not its, and a filter here would drop rows after the total was counted.
      *
-     * @param \Closure(CompositeQuery, non-empty-string): QueryBuilder $hydrate
+     * @param \Closure(CompositeQuery, non-empty-string): QueryBuilder $projection
      * @param non-empty-string                                         $countField
      */
     public static function create(
         Pagination $pagination,
-        CompositeQuery $narrowPage,
+        CompositeQuery $matchingKeys,
         Column $key,
         OrderBy $order,
-        \Closure $hydrate,
+        \Closure $projection,
         string $countField = 'total_results',
     ): self {
-        invariant(null !== $key->from, 'The page key must be table qualified, so the hydration join can be derived.');
+        invariant(null !== $key->from, 'The page key must be table qualified, so the projection join can be derived.');
 
         // First clone the composite to avoid updates on the provided query.
-        $narrowPage = clone $narrowPage;
-        $narrow = $narrowPage->mainQuery();
+        $matchingKeys = clone $matchingKeys;
+        $narrow = $matchingKeys->mainQuery();
         $narrow->addSelect(
             new Alias(
                 Over::aggregation(new Count(SqlExpression::int(1)), Over::fullWindow()),
@@ -96,15 +96,15 @@ final readonly class DeferredProjectionPager implements Pager
          * registered preserved. A parameter bound on the narrow query survives this: the very same builder
          * moves into the `WITH` list, and `execute()` merges every registered CTE builder's parameters.
          */
-        $folded = $narrowPage->moveMainQueryToSubQuery(self::PAGE_ALIAS);
+        $folded = $matchingKeys->moveMainQueryToSubQuery(self::PAGE_ALIAS);
 
-        $fat = $hydrate($folded, self::PAGE_ALIAS);
+        $fat = $projection($folded, self::PAGE_ALIAS);
 
         /**
          * The count is read as a scalar sub-query rather than as a column of the joined CTE, so that a
-         * hydration query which aggregates does not have to group by it. A plain column reference would be
+         * projection which aggregates does not have to group by it. A plain column reference would be
          * neither aggregated nor functionally dependent on the group key, which PostgreSQL rejects, and
-         * wrapping it in `MAX()` is not an option either: that would turn a non-aggregating hydration query
+         * wrapping it in `MAX()` is not an option either: that would turn a non-aggregating projection
          * into an aggregate one and collapse the page to a single row. The value is identical on every row
          * of the page, so reading one is exact. The sub-query is the second reference to a CTE holding one
          * page of narrow rows, which costs nothing.

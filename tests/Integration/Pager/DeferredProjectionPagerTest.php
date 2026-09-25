@@ -7,11 +7,15 @@ namespace PhproTest\DbalTools\Integration\Pager;
 use Doctrine\DBAL\Query\QueryBuilder;
 use Phpro\DbalTools\Expression\Alias;
 use Phpro\DbalTools\Expression\Comparison;
+use Phpro\DbalTools\Expression\Composite;
 use Phpro\DbalTools\Expression\Count;
+use Phpro\DbalTools\Expression\Expression;
 use Phpro\DbalTools\Expression\Factory\NamedParameter;
+use Phpro\DbalTools\Expression\ILike;
 use Phpro\DbalTools\Expression\JsonbAggStrict;
 use Phpro\DbalTools\Expression\JsonbBuildObject;
 use Phpro\DbalTools\Expression\OrderBy;
+use Phpro\DbalTools\Expression\SqlExpression;
 use Phpro\DbalTools\Pager\DeferredProjectionPager;
 use Phpro\DbalTools\Pager\Pagination;
 use Phpro\DbalTools\Query\CompositeQuery;
@@ -146,7 +150,7 @@ final class DeferredProjectionPagerTest extends DbalReaderTestCase
     #[Test]
     public function a_caller_registered_cte_survives_the_fold(): void
     {
-        $composite = self::narrow();
+        $composite = self::matchingKeys();
         $composite->addSubQuery(
             'prolific',
             self::connection()->createQueryBuilder()
@@ -177,7 +181,7 @@ final class DeferredProjectionPagerTest extends DbalReaderTestCase
     #[Test]
     public function a_parameter_bound_on_the_narrow_query_survives_the_fold(): void
     {
-        $composite = self::narrow();
+        $composite = self::matchingKeys();
         $group = NamedParameter::createForTableColumn(
             $composite->mainQuery(),
             UsersTableColumns::FirstName,
@@ -192,6 +196,67 @@ final class DeferredProjectionPagerTest extends DbalReaderTestCase
 
         self::assertSame(['user2', 'user4', 'user6'], self::usernames($pager));
         self::assertSame(3, $pager->totalResults());
+    }
+
+    /**
+     * A filter on related rows belongs in the matching keys, as `EXISTS` so each key stays unique, and the
+     * inner join onto the page is what carries it into the projection: the projection never repeats the
+     * filter, so it still aggregates every post of a matching user rather than only the matching one.
+     */
+    #[Test]
+    public function a_related_row_filter_on_the_matching_keys_narrows_both_page_and_total(): void
+    {
+        $matchingKeys = self::matchingKeys();
+        $search = NamedParameter::createForTableColumn(
+            $matchingKeys->mainQuery(),
+            PostsTableColumns::Post,
+            'post 3 %',
+            ':search',
+        );
+        $matchingKeys->mainQuery()->where(sprintf(
+            'EXISTS (SELECT 1 FROM %s WHERE %s)',
+            PostsTable::name(),
+            Composite::and(
+                Comparison::equal(PostsTableColumns::UserId->column(), UsersTableColumns::Id->column()),
+                new ILike(PostsTableColumns::Post->column(), $search),
+            )->toSQL(),
+        ));
+
+        $pager = self::createPager($matchingKeys, new Pagination(1, 1));
+        $rows = values($pager);
+
+        self::assertSame(['user4'], self::usernames($pager));
+        self::assertSame(2, $pager->totalResults());
+        self::assertSame(2, $pager->totalPages());
+        self::assertSame(['post 1 of user 4', 'post 2 of user 4', 'post 3 of user 4'], self::posts($rows[0]));
+    }
+
+    /**
+     * A condition on the projection's left join limits which related rows are aggregated without dropping a
+     * key, so a user without a match keeps its place on the page and in the total. Its parameter is bound
+     * on the projection, which reaches the statement because `execute()` merges the main query's parameters
+     * next to those of the CTEs.
+     */
+    #[Test]
+    public function a_condition_on_the_projection_join_limits_the_aggregate_but_keeps_every_key(): void
+    {
+        $pager = self::createPager(
+            self::matchingKeys(),
+            new Pagination(1, 3),
+            projection: self::projection(
+                static fn (QueryBuilder $query): ILike => new ILike(
+                    PostsTableColumns::Post->column(),
+                    NamedParameter::createForTableColumn($query, PostsTableColumns::Post, 'post 2 %', ':post'),
+                ),
+            ),
+        );
+        $rows = values($pager);
+
+        self::assertSame(['user1', 'user2', 'user3'], self::usernames($pager));
+        self::assertSame(6, $pager->totalResults());
+        self::assertSame([], self::posts($rows[0]));
+        self::assertSame([], self::posts($rows[1]));
+        self::assertSame(['post 2 of user 3'], self::posts($rows[2]));
     }
 
     /**
@@ -217,7 +282,7 @@ final class DeferredProjectionPagerTest extends DbalReaderTestCase
     #[Test]
     public function it_can_deal_with_empty_resultset(): void
     {
-        $composite = self::narrow();
+        $composite = self::matchingKeys();
         $composite->mainQuery()->where('false');
 
         $pager = self::createPager($composite, new Pagination(2, 3));
@@ -305,7 +370,7 @@ final class DeferredProjectionPagerTest extends DbalReaderTestCase
     #[Test]
     public function it_does_not_alter_the_provided_query(): void
     {
-        $composite = self::narrow();
+        $composite = self::matchingKeys();
         $originalSql = $composite->toSQL();
 
         self::createPager($composite, new Pagination(2, 2))->totalResults();
@@ -325,10 +390,10 @@ final class DeferredProjectionPagerTest extends DbalReaderTestCase
 
         DeferredProjectionPager::create(
             new Pagination(1, 2),
-            self::narrow(),
+            self::matchingKeys(),
             UsersTableColumns::Id->column()->from(null),
             self::defaultOrder(),
-            self::hydrate(),
+            self::projection(),
         );
     }
 
@@ -340,25 +405,26 @@ final class DeferredProjectionPagerTest extends DbalReaderTestCase
         ?OrderBy $order = null,
         string $countField = 'total_results',
     ): DeferredProjectionPager {
-        return self::createPager(self::narrow(), $pagination, $order, $countField);
+        return self::createPager(self::matchingKeys(), $pagination, $order, $countField);
     }
 
     /**
      * @param non-empty-string $countField
      */
     private static function createPager(
-        CompositeQuery $narrow,
+        CompositeQuery $matchingKeys,
         Pagination $pagination,
         ?OrderBy $order = null,
         string $countField = 'total_results',
+        ?\Closure $projection = null,
     ): DeferredProjectionPager {
         return DeferredProjectionPager::create(
-            $pagination,
-            $narrow,
-            UsersTableColumns::Id->column(),
-            $order ?? self::defaultOrder(),
-            self::hydrate(),
-            $countField,
+            pagination: $pagination,
+            matchingKeys: $matchingKeys,
+            key: UsersTableColumns::Id->column(),
+            order: $order ?? self::defaultOrder(),
+            projection: $projection ?? self::projection(),
+            countField: $countField,
         );
     }
 
@@ -370,7 +436,7 @@ final class DeferredProjectionPagerTest extends DbalReaderTestCase
     /**
      * The narrow half: one column and the filters, with no join and no projection.
      */
-    private static function narrow(): CompositeQuery
+    private static function matchingKeys(): CompositeQuery
     {
         return new CompositeQuery(
             self::connection(),
@@ -386,16 +452,25 @@ final class DeferredProjectionPagerTest extends DbalReaderTestCase
      * the page CTE, since the pager owns the join onto it.
      *
      * It aggregates, and therefore groups, without knowing the pager's count field: the pager reads the count
-     * as a scalar sub-query precisely so that an aggregating hydration query needs no group-by of its own for
-     * it.
+     * as a scalar sub-query precisely so that an aggregating projection needs no group-by of its own for it.
+     *
+     * @param (\Closure(QueryBuilder): Expression)|null $postsCondition narrows the posts it aggregates
      *
      * @return \Closure(CompositeQuery, non-empty-string): QueryBuilder
      */
-    private static function hydrate(): \Closure
+    private static function projection(?\Closure $postsCondition = null): \Closure
     {
-        return static fn (CompositeQuery $folded, string $pageAlias): QueryBuilder => self::connection()
-            ->createQueryBuilder()
-            ->select(
+        return static function (CompositeQuery $folded, string $pageAlias) use ($postsCondition): QueryBuilder {
+            $query = self::connection()->createQueryBuilder();
+            $join = UsersTable::joinOntoPosts();
+            if (null !== $postsCondition) {
+                $join['condition'] = Composite::and(
+                    new SqlExpression($join['condition']),
+                    $postsCondition($query),
+                )->toSQL();
+            }
+
+            return $query->select(
                 ...UsersTable::columns()->select(),
                 ...[new Alias(
                     JsonbAggStrict::onManyLeftJoinedJsonObjects(
@@ -409,9 +484,10 @@ final class DeferredProjectionPagerTest extends DbalReaderTestCase
                     'posts',
                 )->toSQL()],
             )
-            ->from(UsersTable::name())
-            ->leftJoin(...UsersTable::joinOntoPosts())
-            ->groupBy(UsersTableColumns::Id->use());
+                ->from(UsersTable::name())
+                ->leftJoin(...$join)
+                ->groupBy(UsersTableColumns::Id->use());
+        };
     }
 
     /**

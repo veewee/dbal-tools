@@ -690,8 +690,8 @@ use Phpro\DbalTools\Pager\MappingPager;
 use Phpro\DbalTools\Pager\Pagination;
 use Phpro\DbalTools\Query\CompositeQuery;
 
-// The narrow half: the key column and the filters. No projection, no join.
-$narrowPage = new CompositeQuery(
+// The key column and every filter. No projection, no join that only adds data.
+$matchingKeys = new CompositeQuery(
     $connection,
     $connection->createQueryBuilder()
         ->select(UsersTableColumns::Id->select())
@@ -701,12 +701,12 @@ $narrowPage = new CompositeQuery(
 
 $usersPager = new MappingPager(
     DeferredProjectionPager::create(
-        new Pagination(page: $page, limit: $limit),
-        $narrowPage,
-        UsersTableColumns::Id->column(),
-        new OrderBy(OrderBy::field(UsersTableColumns::Username->column(), OrderBy::ASC)),
-        // The fat half: returned, not written in place, and it knows nothing about the page CTE.
-        static fn (CompositeQuery $folded, string $pageAlias): QueryBuilder => $connection->createQueryBuilder()
+        pagination: new Pagination(page: $page, limit: $limit),
+        matchingKeys: $matchingKeys,
+        key: UsersTableColumns::Id->column(),
+        order: new OrderBy(OrderBy::field(UsersTableColumns::Username->column(), OrderBy::ASC)),
+        // The wide select: returned, not written in place, and it knows nothing about the page CTE.
+        projection: static fn (CompositeQuery $folded, string $pageAlias): QueryBuilder => $connection->createQueryBuilder()
             ->select(
                 ...UsersTable::columns()->select(),
                 ...[new Alias(
@@ -730,19 +730,23 @@ $usersPager = new MappingPager(
 
 Things worth knowing:
 
-* The filters and the scope joins belong on the **narrow** query. A filter applied by the hydration closure
-  would narrow the page after the total was computed, so the total would over-report.
-* Every CTE you registered on `$narrowPage` survives the fold, and so does a parameter bound on its main
+* The filters and the scope joins belong on `$matchingKeys`. A filter applied by the projection would drop
+  rows after the total was computed, so the page would come back short and the total would over-report.
+* To filter on a related table, for example users with a matching post, use `EXISTS` on `$matchingKeys`
+  rather than a join: a join yields the key once per matching post. To limit which related rows the
+  projection aggregates, put the condition in its `LEFT JOIN`, not in a `WHERE`, so rows without a match
+  stay on the page.
+* Every CTE you registered on `$matchingKeys` survives the fold, and so does a parameter bound on its main
   query: that same query builder is moved into the `WITH` list, and `CompositeQuery::execute()` merges the
   parameters of every registered builder.
-* The key must be table qualified (the join is derived from it) and unique in the narrow set. A duplicate
-  multiplies the hydrated rows and makes the total disagree with the page.
+* The key must be table qualified (the join is derived from it) and unique among the matching keys. A
+  duplicate multiplies the projected rows and makes the total disagree with the page.
 * Aggregate freely. The pager reads its count as a scalar sub-query rather than as a column of the joined
-  CTE, so a hydration query that groups needs no group-by for it.
+  CTE, so a projection that groups needs no group-by for it.
 * The pager owns the join onto the page CTE, the count column, and the order - which it applies to both
   levels, since the narrow sort decides *which* rows the page holds and the outer one the order they come
   back in. The closure only supplies its projection.
-* The hydration closure **returns** its query rather than writing onto the folded main query, because
+* The projection closure **returns** its query rather than writing onto the folded main query, because
   `QueryBuilder` keeps its select, from and join parts private with no setters.
 * Rows are yielded verbatim, the count field included, exactly like `WindowCountPager`.
 
