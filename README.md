@@ -682,6 +682,8 @@ It remains a single statement, so there is one snapshot and no second round trip
 ```php
 use Doctrine\DBAL\Query\QueryBuilder;
 use Phpro\DbalTools\Expression\Alias;
+use Phpro\DbalTools\Expression\Factory\NamedParameter;
+use Phpro\DbalTools\Expression\ILike;
 use Phpro\DbalTools\Expression\JsonbAggStrict;
 use Phpro\DbalTools\Expression\JsonbBuildObject;
 use Phpro\DbalTools\Expression\OrderBy;
@@ -691,11 +693,16 @@ use Phpro\DbalTools\Pager\Pagination;
 use Phpro\DbalTools\Query\CompositeQuery;
 
 // Which rows: the key column and every filter. No display columns, no join that only adds data.
+$keys = $connection->createQueryBuilder();
 $matchingKeys = new CompositeQuery(
     $connection,
-    $connection->createQueryBuilder()
+    $keys
         ->select(UsersTableColumns::Id->select())
-        ->from(UsersTable::name()),
+        ->from(UsersTable::name())
+        ->where(new ILike(
+            UsersTableColumns::Username->column(),
+            NamedParameter::createForTableColumn($keys, UsersTableColumns::Username, 'jo%', ':username'),
+        )->toSQL()),
     [],
 );
 
@@ -727,6 +734,32 @@ $usersPager = new MappingPager(
     ),
     $userMapper,
 );
+```
+
+For page 2 with a limit of 10, that runs as one statement. The main query of `$matchingKeys` became the
+`deferred_page` CTE, with the count window, the order and the page added to it. The projection became the
+new main query, joined onto that CTE:
+
+```sql
+WITH deferred_page AS (
+    SELECT users.user_id, COUNT(1) OVER() AS total_results
+    FROM users
+    WHERE users.username ILIKE :username
+    ORDER BY users.username ASC
+    LIMIT 10 OFFSET 10
+)
+SELECT
+    users.user_id, users.username, users.first_name, users.last_name,
+    jsonb_agg_strict(
+        CASE WHEN posts.post_id IS NULL THEN NULL
+        ELSE jsonb_build_object('id', posts.post_id, 'post', posts.post) END
+    ) AS posts,
+    (SELECT deferred_page.total_results FROM deferred_page LIMIT 1) AS total_results
+FROM users
+LEFT JOIN posts posts ON users.user_id = posts.user_id
+INNER JOIN deferred_page deferred_page ON users.user_id = deferred_page.user_id
+GROUP BY users.user_id
+ORDER BY users.username ASC
 ```
 
 You describe the list twice:
